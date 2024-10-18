@@ -1,0 +1,758 @@
+---
+title: "Projekt2"
+output: html_document
+date: "2024-04-18"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r libraries}
+# Load required packages
+library(ggplot2)
+library(rmarkdown)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(corrplot)
+library(reshape2)
+library(randomForest)
+library(nnet)
+library(knitr)
+library(e1071)
+library(ROCR)
+library(rsample)
+library(splines)
+library(glmnet)
+```
+
+## Dataset
+
+The dataset represents 10 years (1999-2008) of clinical care at 130 US
+hospitals and integrated delivery networks. It includes over 50 features
+representing patient and hospital outcomes.
+
+The data contains such attributes as patient number, race, gender, age,
+admission type, time in hospital, medical specialty of admitting
+physician, number of lab test performed, HbA1c test result, diagnosis,
+number of medication, diabetic medications, number of outpatient,
+inpatient, and emergency visits in the year before the hospitalization,
+etc.
+
+```         
+https://api.openml.org/d/45069
+```
+
+```{r df}
+#Data loading from csv
+df <- read.csv("./output.csv")
+head(df)
+```
+
+Target of the dataset is Class. It has information about the risk of
+readmision for diabetes patients. If they were hospitalized after more
+then 30, less then thirty days or never.
+
+```{r summary}
+#Basic statistics of the dataset
+summary(df)
+```
+
+The Dataset provides a overview of patient information, including
+demographic details, medical history, hospital visits, diagnostic codes,
+and medication records.
+
+It consists of a total of 34 variables:
+
+-   22 categorical variables
+
+-   12 numerical variables
+
+```{r nonnumeric}
+non_numeric_columns <- df[, sapply(df, function(x) !is.numeric(x))]
+```
+
+```{r class distribution}
+# Plotting percentage of attribute values
+attribute_value_percentages <- prop.table(table(df$class)) * 100
+
+# Plot the percentages
+barplot(attribute_value_percentages, xlab='Attribute Values', ylab='Percentage', main='Percentage of Attribute Values')
+
+```
+
+To deal with class imbalance and to better the accuracy we decided to
+merge the two classes of after how many days patients returned to
+hospital. We also merged it so we could use binary classification
+
+```{r class distributin2}
+df$class <- ifelse(df$class == "<30" | df$class == ">30", "YES", df$class)
+# Plotting percentage of attribute values
+attribute_value_percentages <- prop.table(table(df$class)) * 100
+
+# Plot the percentages
+barplot(attribute_value_percentages, xlab='Attribute Values', ylab='Percentage', main='Percentage of Attribute Values')
+```
+
+After examining data and missing values we decided to drop features
+**weight** as it has more then 96% missing and it would be too difficult
+to try to replace the missing values. We also dropped columns
+**payer_code** and **medical_specialty** as they also have high
+percentage of missing values and they are not important to predicting
+patient rehospitalization risk.
+
+```{r missing values}
+df[df == ""] <- NA
+# Missing values information
+missing_values <- colSums(is.na(df))
+present_values <- colSums(!is.na(df))
+
+missing_percentage <- (missing_values / nrow(df)) * 100
+
+# Create a data frame containing columns for missing values, present values, and missing percentage
+missing_info_df <- data.frame(Missing_Values = missing_values,
+                              Present_Values = present_values,
+                              Missing_Percentage = missing_percentage)
+
+# Sort the data frame by the "Missing Percentage" column in descending order
+missing_info_df_sorted <- missing_info_df[order(-missing_info_df$Missing_Percentage), ]
+
+(head(missing_info_df_sorted, 10))
+```
+
+```{r missing atributes}
+#Finding out what kind of atributes is medical_speciality
+unique_values <- unique(df$medical_specialty)
+print(unique_values)
+```
+
+```{r drop columns}
+columns_to_drop <- c('weight', 'medical_specialty', 'payer_code')
+df <- df[, !names(df) %in% columns_to_drop]
+```
+
+We also decided to drop rows, where there was a missing value because we
+have a large dataset (101766 rows) and deleting about 4000 thousand rows
+won't make difference in the result prediction.
+
+```{r missing rows}
+missing_rows <- rowSums(is.na(df))
+cat("Number of rows with missing values:", sum(missing_rows))
+
+df <- na.omit(df)
+```
+
+We've added outlier detection and replacement with the median for
+numerical columns in the dataset. The function detect_replace_outliers
+calculates quartiles and interquartile range to identify outliers, which
+are then replaced with the column's median. Applied to all numerical
+columns using lapply, this ensures outliers are addressed uniformly. The
+dataset is then displayed to reflect the changes.
+
+```{r outlier}
+unique(df$number_emergency)
+# Function to detect and replace outliers with median
+detect_replace_outliers <- function(x) {
+  # Calculate the first and third quartiles
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  
+  # Calculate the interquartile range (IQR)
+  IQR <- Q3 - Q1
+  
+  # Define lower and upper bounds for outliers detection
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  
+  # Detect outliers
+  outliers <- x < lower_bound | x > upper_bound
+  
+  # Replace outliers with median
+  x[outliers] <- median(x, na.rm = TRUE)
+  
+  return(x)
+}
+
+# Apply outlier detection and replacement to numerical columns
+numeric_columns <- df[, sapply(colnames(df), function(x) is.numeric(df[[x]]) && !grepl("number_emergency", x))]
+
+
+df[, names(numeric_columns)] <- lapply(numeric_columns, detect_replace_outliers)
+
+# Check the data after outlier detection and replacement
+head(df)
+unique(df$number_emergency)
+```
+
+On numerical data we decided to use Min-MAx Scaling to ensure that all
+numeric features are on a similar scale, which can be beneficial for
+machine learning algorithms and data visualization.
+
+```{r normalization}
+unique(df$number_emergency)
+# Perform Min-Max scaling for numeric columns
+normalize <- function(x) {
+  if (all(is.na(x)) || any(is.na(x))) {
+    return(x)  # Return the original vector if it contains any NA values
+  } else if (length(unique(x)) == 1) {
+    return(rep(0, length(x)))   # Return 0 if all values are identical
+  } else {
+    return((x - min(x)) / (max(x) - min(x)))
+  }
+}
+
+# Apply normalization to numeric columns
+numeric_columns <- df[, sapply(df, is.numeric)]
+
+# Normalize numeric columns
+df[, names(numeric_columns)] <- lapply(numeric_columns, normalize)
+
+# Check the normalized data
+head(df)
+unique(df$number_emergency)
+```
+
+The nonumerical values we decided to transform with label encoding to
+convert categorical values into numerical representations. Label
+encoding preserves the ordinal relationship between categories, making
+it suitable for ordinal categorical variables.
+
+```{r encoding}
+# Identify columns with non-numeric values
+non_numeric_columns <- df[, sapply(df, function(x) !is.numeric(x))]
+
+# Perform label encoding for each non-numeric column
+for (col in colnames(non_numeric_columns)) {
+  df[[col]] <- as.numeric(factor(df[[col]]))
+}
+
+# Check the data types of columns after label encoding
+head(df)
+```
+
+For making classification model we first decided to check the
+correlation between the features to choose the most significant ones.
+
+```{r corr}
+corr_mat <- round(cor(df), 2)
+
+# Get the absolute correlation values of each feature with the target variable "class"
+class_correlation <- abs(corr_mat[, "class"])
+
+# Get the names of the top 10 correlated features with "class"
+top_features <- names(head(sort(class_correlation, decreasing = TRUE), 10))
+
+# Filter the correlation matrix to include only the top correlated features with "class"
+corr_mat_top <- corr_mat[top_features, top_features]
+
+# Melt the correlation matrix
+melted_corr_mat_top <- melt(corr_mat_top)
+
+# Plot the correlation heatmap for top correlated features with "class"
+ggplot(data = melted_corr_mat_top, aes(x = Var1, y = Var2, fill = value)) + 
+  geom_tile() +
+  geom_text(aes(label = value), color = "black", size = 4) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       limits = c(-1, 1), na.value = "grey50") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Top 10 Correlated Features with 'class'")
+```
+
+Data preprocessing have ensured that the dataset is clean,
+well-structured, and ready for training SVM and Naive Bayes models. Both
+SVM and Naive Bayes are classifiers that can handle both numerical and
+categorical data effectively, making them suitable choices for this
+preprocessed dataset.
+
+Based on correlation matrix we chose to work with predictors:
+time_in_hospital, number_inpatient and number_diagnoses
+
+```{r class_values}
+
+df$class <- ifelse(df$class == 1, 0, df$class)
+df$class <- ifelse(df$class == 2, 1, df$class)
+unique(df$class)
+```
+
+# Clasification
+
+H0: There is no association between the number of times a patient was
+admitted to the hospital (number_inpatient) and the risk of readmission.
+H0: The time spent in the hospital (time_in_hospital) does not affect
+the risk of readmission.
+
+```{r class train & test}
+train_index <- createDataPartition(df$class, p = 0.7, list = FALSE)
+train_data <- df[train_index, ]
+test_data <- df[-train_index, ]
+```
+
+```{r clasification}
+model <- glm(class ~ time_in_hospital + number_inpatient, data = train_data, family = binomial)
+summary(model)
+```
+
+Based on the values we reject both hypothesis. Hypothesis (H1): The
+coefficient for the variable number_inpatient is positive (8.89578) and
+statistically significant (Pr(\>\|z\|) \< 2e-16). This indicates that as
+the number of inpatient admissions increases, the log odds of the
+outcome (risk of readmission) also increase significantly.
+
+Hypothesis (H2):The coefficient for the variable time_in_hospital is
+also positive (0.28446) and statistically significant (Pr(\>\|z\|) \<
+2e-16). This suggests that as the time spent in the hospital increases,
+the log odds of the outcome (risk of readmission) also increase
+significantly.
+
+```{r roc}
+library(ROCit)
+roc <- rocit(class = model$y,
+             score = model$fitted.values)
+
+par(mfrow = c(1,2))
+plot(roc)
+ksplot(roc)
+```
+
+The ROC curve illustrates the trade-off between sensitivity (true
+positive rate) and specificity (true negative rate) for different
+threshold values. It plots the true positive rate (sensitivity) against
+the false positive rate (1 - specificity). A diagonal line represents
+random guessing, and a curve above the diagonal indicates
+better-than-random performance.
+
+The KS plot visualizes the cumulative distribution functions (CDFs) of
+the positive and negative classes, showing the separation between the
+two distributions. The Kolmogorov-Smirnov statistic measures the maximum
+distance between the two CDFs, providing a single summary statistic of
+the model's discrimination ability.
+
+```{r roc summary}
+summary(roc)
+```
+
+```{r class prediction}
+# Generate predictions using your logistic regression model
+glm.prediction <- predict(model, newdata = test_data,type = "response")
+
+# Convert predictions to factors (0 or 1) based on a threshold
+glm.prediction <- ifelse(glm.prediction >= 0.5, 1, 0)
+
+# Create a confusion matrix
+cm0 <- confusionMatrix(factor(glm.prediction), factor(test_data$class))
+cm0
+```
+
+
+# Naive Bayes
+Naive Bayes assumes that all features are independent of each other given the class label. However in real-world it is hard to achieve and datasets features may be correlated. Overal our features don't have high correlation so our data are suited for Naive Bayes. We selected for clasification, for the first two we selected features with low correlation between each other and for the third we selected features with higer correlation to experiment how it will influence the predictions: 
+
+    - time_in_hospital + number_inpatient
+    
+    - number_diagnoses + number_emergency
+    
+    - number_inpatient + number_emergency 
+    
+    
+
+Naive Bayes Model Training: We iterate through different Laplace smoothing parameters to train Naive Bayes models.
+Laplace smoothing is applied to handle zero probabilities and improve model generalization.
+
+Model Evaluation: Each model is trained with the time_in_hospital and number_inpatient features.
+We calculate the accuracy of each model prediction on the dataset.
+
+Selection of Best Model: We update best_accuracy and best_alpha if a model achieves higher accuracy than the previous best. The loop iterates through all alpha values to find the best performing model. 
+
+
+```{r NB}
+
+# Train the Naive Bayes model with Laplace smoothing parameter (alpha)
+alphas <- seq(0, 1, by = 0.1) # Range of Laplace smoothing parameters to try
+
+best_accuracy <- 0 # Variable to store the best accuracy
+best_alpha <- NULL # Variable to store the best Laplace smoothing parameter
+
+for (alpha in alphas) {
+  nb_model <- naiveBayes(class ~ time_in_hospital + number_inpatient, 
+                         data = train_data, 
+                         laplace = alpha) # Adjust Laplace smoothing
+  
+  nb.prediction <- predict(nb_model, newdata = test_data)
+  
+  accuracy <- mean(nb.prediction == test_data$class) # Calculate accuracy
+  
+  if (accuracy > best_accuracy) {
+    best_accuracy <- accuracy
+    best_alpha <- alpha
+  }
+}
+```
+
+Throughout the loop, we keep track of the best achieved accuracy.
+
+```{r eva}
+# Print the best parameter and accuracy
+cat("Best Laplace Smoothing Parameter:", best_alpha, "\n")
+cat("Best Accuracy:", best_accuracy, "\n")
+```
+
+
+## First model
+```{r NB1}
+# Train the Naive Bayes model
+nb_model_1 <- naiveBayes(class ~ time_in_hospital + number_inpatient, data = train_data, laplace = best_alpha)
+nb_model_1 
+```
+
+```{r NB1 P}
+# Generate predictions using the Naive Bayes model
+nb.prediction <- predict(nb_model_1, newdata = test_data)
+
+# Create a confusion matrix
+cm1 <- confusionMatrix(factor(nb.prediction), factor(test_data$class))
+cm1
+
+# Compute ROC curve and auROC for Naive Bayes model 1
+nb_roc_1 <- prediction(as.numeric(nb.prediction), as.numeric(test_data$class))
+nb_perf_1 <- performance(nb_roc_1, "tpr", "fpr")
+nb_auc_1 <- performance(nb_roc_1, "auc")@y.values[[1]]
+```
+
+## Second model
+
+```{r NB2}
+# Train the Naive Bayes model
+nb_model_2 <- naiveBayes(class ~ number_diagnoses + number_emergency, data = train_data, laplace = best_alpha)
+nb_model_2
+```
+
+```{r nb2P}
+# Generate predictions using the Naive Bayes model
+nb.prediction <- predict(nb_model_2, newdata = test_data)
+
+# Create a confusion matrix
+cm2 <- confusionMatrix(factor(nb.prediction), factor(test_data$class))
+cm2
+
+nb_roc_2 <- prediction(as.numeric(nb.prediction), as.numeric(test_data$class))
+nb_perf_2 <- performance(nb_roc_2, "tpr", "fpr")
+nb_auc_2 <- performance(nb_roc_2, "auc")@y.values[[1]]
+```
+
+## Third model
+
+```{r NB3}
+# Train the Naive Bayes model
+nb_model_3 <- naiveBayes(class ~ number_inpatient + number_emergency, data = train_data, laplace = best_alpha)
+nb_model_3
+```
+
+```{r nb3P}
+# Generate predictions using the Naive Bayes model
+nb.prediction <- predict(nb_model_3, newdata = test_data)
+
+# Create a confusion matrix
+cm3 <- confusionMatrix(factor(nb.prediction), factor(test_data$class))
+cm3
+
+nb_roc_3 <- prediction(as.numeric(nb.prediction), as.numeric(test_data$class))
+nb_perf_3 <- performance(nb_roc_3, "tpr", "fpr")
+nb_auc_3 <- performance(nb_roc_3, "auc")@y.values[[1]]
+```
+
+
+```{r roc_plot}
+# Plot ROC curves for Naive Bayes models
+plot(nb_perf_1, col = "blue", main = "ROC Curve - Naive Bayes Models")
+plot(nb_perf_2, col = "red", add = TRUE)
+plot(nb_perf_3, col = "green", add = TRUE)
+
+# Add legend
+legend("bottomright", legend = c("NB Model 1", "NB Model 2", "NB Model 3"),
+       col = c("blue", "red", "green"), lty = 1)
+
+# Print auROC for each Naive Bayes model
+cat("auROC for Naive Bayes model 1:", nb_auc_1, "\n")
+cat("auROC for Naive Bayes model 2:", nb_auc_2, "\n")
+cat("auROC for Naive Bayes model 3:", nb_auc_3, "\n")
+```
+
+Best Model (Logistic Regression - LR): LR has the highest AUC among the models, indicating better predictions. Additionally, LR has a balanced precision and recall, which is important for minimizing false positives and false negatives in classification tasks. 
+
+Worst Model (Naive Bayes 2 - NB2): NB2 has the lowest AUC among the models. NB2's lower precision with significantly high recall indicates high ammount of false positive predictions. 
+
+```{r NB comp}
+# Function to extract metrics from confusion matrix
+extract_metrics <- function(confusion_matrix) {
+  accuracy <- confusion_matrix$overall["Accuracy"]
+  precision <- confusion_matrix$byClass["Pos Pred Value"]
+  recall <- confusion_matrix$byClass["Sensitivity"]
+  return(c(accuracy = accuracy, precision = precision, recall = recall))
+}
+
+# Extract metrics for each confusion matrix
+matrics0 <- extract_metrics(cm0)
+metrics1 <- extract_metrics(cm1)
+metrics2 <- extract_metrics(cm2)
+metrics3 <- extract_metrics(cm3)
+
+# Create a table without AUC values for now
+metrics_table <- rbind(matrics0, metrics1, metrics2, metrics3)
+rownames(metrics_table) <- c("LR time_in_hospital + number_inpatient", "NB1 time_in_hospital + number_inpatient", "NB2 number_diagnoses + number_emergency", "NB3 number_inpatient + number_emergency")
+colnames(metrics_table) <- c("Accuracy", "Precision", "Recall")
+
+# Insert the AUC values as the first column in the table
+AUC_values <- c("", nb_auc_1, nb_auc_2, nb_auc_3)
+metrics_table <- cbind(AUC = AUC_values, metrics_table)
+
+# Print the table
+metrics_table
+
+```
+
+
+
+# Regression
+
+H0: There is no association between the number of emergency admissions
+(number_emergency) and the number of diagnoses (number_diagnoses),
+suggesting that the frequency of emergency admissions does not have a
+linear relationship with the number of diagnoses.
+
+H0: There is no association between the race of the patient (race) and
+the number of diagnoses (number_diagnoses), indicating that the
+patient's race does not have a linear relationship with the number of
+diagnoses.
+
+```{r regress train & test}
+train_index <- createDataPartition(df$number_diagnoses, p = 0.7, list = FALSE)
+train_data_lm <- df[train_index, ]
+test_data_lm <- df[-train_index, ]
+
+```
+
+```{r regression}
+
+model <- lm(number_diagnoses ~ number_emergency + race, data=train_data_lm) 
+summary(model)
+```
+
+```{r check}
+par(mfrow = c(1,3)) # par() sets up a plotting grid: 1 row x 3 columns
+plot(model, which = c(1,2,5))
+```
+
+The coefficient estimate for number_emergency is 0.8657258 with a very
+small p-value (p \< 0.001). This suggests that there is a statistically
+significant positive association between the number of emergency
+admissions and the number of diagnoses. Therefore, we reject the null
+hypothesis H0 for the association between the number of emergency
+admissions and the number of diagnoses.
+
+The coefficient estimate for race is 0.0149152 with a very small p-value
+(p \< 0.001). This indicates that there is a statistically significant
+positive association between the patient's race and the number of
+diagnoses. Therefore, we reject the null hypothesis H0 for the
+association between the patient's race and the number of diagnoses.
+
+```{r regress rss & rmse}
+residuals <- residuals(model)
+RSS <- sum(residuals^2)
+RMSE <- sqrt(mean(residuals^2))
+RSS; RMSE
+```
+
+```{r regress mse}
+regression_predictions <- predict(model, newdata = test_data_lm)
+mse <- mean((regression_predictions - test_data$number_diagnoses)^2)
+mse
+```
+
+## Regularized Regression
+We used this type of regression to reduce the magnitude and fluctuations of coefficients and variance of our model.
+Regularization methods provide a means to control our regression coefficients, which can reduce the variance and decrease our of sample error.
+
+```{r regularized data}
+train_x <- model.matrix(number_diagnoses ~ ., train_data_lm)[, -1]
+train_y <- train_data_lm$number_diagnoses
+
+test_x <- model.matrix(number_diagnoses ~ ., test_data_lm)[, -1]
+test_y <- test_data_lm$number_diagnoses
+
+dim(train_x)
+```
+
+# Ridge
+
+```{r ridge}
+ridge <- glmnet(
+  x = train_x,
+  y = train_y,
+  alpha = 0
+)
+
+plot(ridge, xvar = "lambda")
+```
+
+```{r ridge cv}
+ridge_cv <- cv.glmnet(
+  x = train_x,
+  y = train_y,
+  alpha = 0
+)
+
+plot(ridge_cv)
+```
+
+## Lasso
+
+```{r lasso}
+lasso <- glmnet(
+  x = train_x,
+  y = train_y,
+  alpha = 1
+)
+
+plot(lasso, xvar = "lambda")
+```
+
+```{r lasso cv}
+lasso_cv <- cv.glmnet(
+  x = train_x,
+  y = train_y,
+  alpha = 1
+)
+
+plot(lasso_cv)
+```
+
+```{r lasso features}
+# Extract coefficients for the optimal lambda
+lasso_coef <- coef(lasso_cv, s = "lambda.1se")
+
+# Convert coefficients to a regular matrix
+lasso_coef_matrix <- as.matrix(lasso_coef)
+
+# Extract variable names
+variable_names <- rownames(lasso_coef_matrix)[-1]  # Exclude the intercept term
+
+# Create a data frame with coefficients and variable names
+lasso_coef_df <- data.frame(Variable = variable_names, Coefficient = lasso_coef_matrix[-1])
+
+# Filter out rows where Coefficient is zero
+lasso_coef_df <- lasso_coef_df[lasso_coef_df$Coefficient != 0, ]
+
+# Plot influential variables
+ggplot(lasso_coef_df, aes(x = Coefficient, y = reorder(Variable, Coefficient), color = Coefficient > 0)) +
+  geom_point() +
+  ggtitle("Influential variables") +
+  xlab("Coefficient") +
+  ylab(NULL) +
+  theme_minimal()
+```
+
+```{r ridge eval}
+min(ridge_cv$cvm)
+
+pred <- predict(ridge_cv, s = ridge_cv$lambda.min, test_x)
+ridge_mse <- mean((test_y - pred)^2)
+ridge_mse
+```
+
+```{r lasso eval}
+min(lasso_cv$cvm)
+
+pred <- predict(lasso_cv, s = lasso_cv$lambda.min, test_x)
+lasso_mse <- mean((test_y - pred)^2)
+lasso_mse
+```
+
+```{r ridge 2 predictors}
+train_x_temp <- model.matrix(number_diagnoses ~ number_emergency + race, train_data_lm)[, -1]
+train_y_temp <- train_data_lm$number_diagnoses
+
+test_x_temp <- model.matrix(number_diagnoses ~ number_emergency + race, test_data_lm)[, -1]
+test_y_temp <- test_data_lm$number_diagnoses
+
+cv_ridge_2p <- cv.glmnet(train_x_temp, train_y_temp, alpha = 1.0)
+
+pred <- predict(cv_ridge_2p, s = cv_ridge_2p$lambda.min, test_x_temp)
+ridge_2p_mse = mean((test_y_temp - pred)^2)
+ridge_2p_mse
+```
+
+```{r lasso 2 predictors}
+lasso_2p <- cv.glmnet(train_x_temp, train_y_temp, alpha = 1.0)
+
+pred <- predict(lasso_2p, s = lasso_2p$lambda.min, test_x_temp)
+lasso_2p_mse = mean((test_y_temp - pred)^2)
+print(lasso_2p_mse)
+```
+```{r regularized regression eval}
+metrics_table <- rbind(mse, ridge_mse, lasso_mse, ridge_2p_mse, lasso_2p_mse)
+rownames(metrics_table) <- c("LM 2p", "ridge w/all", "lasso w/all", "lasso 2p", "ridge 2p")
+colnames(metrics_table) <- c("MSE")
+metrics_table
+```
+## Splines
+By dividing the range of predictor variables into smaller segments and fitting polynomial functions within each segment, splines can approximate intricate curves and capture localized variations in the data.
+```{r base spline}
+spline_base <- lm(number_diagnoses ~ ns(time_in_hospital, df = 4) + ns(race, df=4), data = train_data_lm)
+predicted_values <- predict(spline_base, newdata = test_data_lm)
+
+spline_base_mse <- mean((test_data_lm$number_diagnoses - predicted_values)^2)
+print(spline_base_mse)
+
+summary(spline_base)
+```
+```{r base spline 2}
+spline_base2 <- lm(number_diagnoses ~ ns(race, df = 4) + ns(number_inpatient, df=4), data = train_data_lm)
+predicted_values <- predict(spline_base2, newdata = test_data_lm)
+
+spline_base2_mse <- mean((test_data_lm$number_diagnoses - predicted_values)^2)
+print(spline_base2_mse)
+
+summary(spline_base2)
+```
+```{r base spline 3}
+spline_base3 <- lm(number_diagnoses ~ ns(age, df = 4) + ns(num_procedures, df=4), data = train_data_lm)
+predicted_values <- predict(spline_base3, newdata = test_data_lm)
+
+spline_base3_mse <- mean((test_data_lm$number_diagnoses - predicted_values)^2)
+print(spline_base3_mse)
+
+summary(spline_base3)
+```
+
+```{r knots}
+
+knots_num_medications <- quantile(train_data_lm$num_medications, probs = c(0.25, 0.5, 0.75))
+knots_insulin <- quantile(train_data_lm$insulin, probs = c(0.25, 0.5, 0.75))
+
+spline_num_medications <- bs(train_data_lm$num_medications, knots = knots_num_medications, degree = 3)
+spline_insulin <- bs(train_data_lm$insulin, knots = knots_insulin, degree = 3)
+
+spline_knots <- lm(number_diagnoses ~ spline_num_medications + spline_insulin, data = train_data_lm) 
+predicted_values <- predict(spline_knots, newdata = test_data_lm)
+
+spline_knot_mse <- mean((test_data_lm$number_diagnoses - predicted_values)^2)
+print(spline_knot_mse)
+
+summary(spline_knots)
+```
+```{r splines regression eval}
+metrics_table <- rbind(mse, spline_base_mse, spline_base2_mse, spline_base3_mse, spline_knot_mse)
+rownames(metrics_table) <- c("LM: n. emergency + race", "base spline: time in hospital + race", 
+                             "base spline: n. inpatient + race", "base spline: n. of procedures + age", "spline w/knots: n. of medications + insulin")
+colnames(metrics_table) <- c("MSE")
+metrics_table
+```
+
+In the end we summarised that regularized regression helped with our mse the most, but the differences werent very significant, which indicates that the original model wasnt overfitting as much.
+As for splines, we tried fitting non-linear features against our original dependent variable, and the average variance among model summaries indicates we were able to get meaningful results even from these, despite scoring higher or same levels of mse.
